@@ -1,0 +1,47 @@
+# ========================
+# 后端 (Python)
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.env
+
+# 忽略本地 SQLite 数据库文件 (强烈建议不要把本地数据推上公开仓库)
+data.db
+*.sqlite3
+
+# ========================
+# 前端 (Node.js / React)
+# ========================
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ========================
+# 操作系统生成文件
+# ========================
+.DS_Store
+Thumbs.db

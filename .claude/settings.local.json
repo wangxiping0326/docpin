@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs wc -l)",
+      "Bash(python -c \"from services.injection_service import get_shot_state, start_injection, stop_injection, get_yao_recommend; print\\('imports OK'\\)\")",
+      "Bash(python -c \"import main; print\\('main.py imports OK'\\)\")"
+    ]
+  }
+}
