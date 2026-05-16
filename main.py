@@ -1,5 +1,5 @@
 """
-docpin - 高精度智能电子注射器管控系统
+高精度智能电子注射器管控系统
 启动方式: pip install -r requirements.txt && python main.py
 然后浏览器打开 http://localhost:8000
 """
@@ -21,7 +21,7 @@ from ws_manager import ws_pool
 from auth import parse_token
 
 # 创建 app
-app = FastAPI(title="docpin", version="1.0.0", docs_url="/api/docs")
+app = FastAPI(title="高精度智能电子注射器管控系统", version="1.0.0", docs_url="/api/docs")
 
 # CORS - 局域网多终端嘛，放通
 app.add_middleware(
@@ -192,7 +192,7 @@ else:
 @app.on_event("startup")
 async def on_startup():
     print("=" * 50)
-    print("  docpin 注射器管控系统 启动中...")
+    print("  高精度智能电子注射器管控系统 启动中...")
     print("=" * 50)
     init_db()
     init_device()

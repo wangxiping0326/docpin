@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Read(*)",
+      "Write(e:/Users/ASUS/Desktop/docpin/*)"
     ]
   }
 }

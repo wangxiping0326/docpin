@@ -24,7 +24,7 @@ export default function Login({ onLogin }) {
 
   return (
     <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', background: '#f0f2f5' }}>
-      <Card title="docpin 注射器管控系统" style={{ width: 380, boxShadow: '0 2px 12px rgba(0,0,0,.1)' }}>
+      <Card title="高精度智能电子注射器管控系统" style={{ width: 380, boxShadow: '0 2px 12px rgba(0,0,0,.1)' }}>
         <Form onFinish={doLogin} size="large">
           <Form.Item name="username" rules={[{ required: true, message: '输用户名' }]}>
             <Input prefix={<UserOutlined />} placeholder="用户名" />

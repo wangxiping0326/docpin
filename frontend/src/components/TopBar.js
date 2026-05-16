@@ -40,7 +40,7 @@ export default function TopBar({ me, onLogout }) {
   return (
     <div className="topbar">
       <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
-        <h3>💉 docpin</h3>
+        <h3>💉 高精度智能电子注射器管控系统</h3>
         <Menu
           theme="dark" mode="horizontal"
           selectedKeys={[cur === '/' ? '/dash' : cur]}
