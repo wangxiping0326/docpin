@@ -1,76 +1,167 @@
-# 注射核心业务逻辑 - 有点乱，但能用
+# 注射核心逻辑 - device_state持久化 + 协议帧 + 恢复
 import threading
 import time
 import random
 import math
+import uuid
 from datetime import datetime
 from database import get_db
 from services.alarm_service import check_alarms
 from services.device_service import get_device_status, is_sim_mode
 
-# 当前注射状态 - 全局的，简单粗暴
 _shot_state = {
-    "running": False,
-    "mode": "",
-    "su_lv": 0,
-    "ji_liang": 0,
-    "total": 0,
-    "elapsed": 0,
-    "remaining": 0,
-    "yali_now": 50.0,
-    "yao_left": 10.0,
-    "started_by": "",  # 谁启动的
-    "device_id": None,
-    "record_id": None,
-    "jiting": False,  # 是否被紧急中断
-    "paused": False,
-    "curve_points": [],  # 自定义曲线用的
-    "jian_ge": 0,        # 间隔时间
-    "jian_ge_left": 0,   # 间隔剩余
+    "running": False, "mode": "", "su_lv": 0, "ji_liang": 0,
+    "total": 0, "elapsed": 0, "remaining": 0,
+    "yali_now": 50.0, "yao_left": 10.0,
+    "started_by": "", "device_id": None, "record_id": None,
+    "jiting": False, "paused": False,
+    "curve_points": [], "jian_ge": 0, "jian_ge_left": 0,
+    "lock_token": None,
 }
 
 _lock = threading.Lock()
 _bg_thread = None
-_curve_idx = 0  # 自定义曲线当前段
+_curve_idx = 0
 
 def get_shot_state():
     with _lock:
         return dict(_shot_state)
 
-# ---------- 自定义曲线相关 ----------
+# ---------- device_state 持久化 ----------
+
+def _persist_device_state():
+    """把当前状态写入 device_state 表（WAL模式下高频写）"""
+    with _lock:
+        db = get_db()
+        db.execute("""
+            UPDATE device_state SET
+                is_running=?, mode=?, target_dose=?, remaining_dose=?,
+                elapsed_seconds=?, total_seconds=?, yali_now=?,
+                lock_token=?, updated_at=datetime('now','localtime')
+            WHERE id=1
+        """, (
+            1 if _shot_state["running"] else 0,
+            _shot_state["mode"],
+            _shot_state["ji_liang"],
+            _shot_state["yao_left"],
+            int(_shot_state["elapsed"]),
+            int(_shot_state["total"]),
+            _shot_state["yali_now"],
+            _shot_state["lock_token"],
+        ))
+        db.commit()
+
+def _clear_device_state():
+    """清除运行状态"""
+    db = get_db()
+    db.execute("""
+        UPDATE device_state SET is_running=0, lock_token=NULL,
+        updated_at=datetime('now','localtime') WHERE id=1
+    """)
+    db.commit()
+
+# ---------- 启动时状态恢复 ----------
+
+def recover_state(ws_pool=None):
+    """启动时读 device_state，尝试恢复"""
+    db = get_db()
+    row = db.execute("SELECT * FROM device_state WHERE id=1 AND is_running=1").fetchone()
+    if not row:
+        return  # 没有在跑的任务
+
+    print("[RECOVER] 发现未完成的注射记录，尝试恢复...")
+
+    # 尝试与硬件握手
+    from services.protocol import pack_status_query, CMD_STATUS_REPORT
+    from services.device_service import send_frame_and_wait, get_virtual_device
+
+    qframe = pack_status_query()
+    resp = send_frame_and_wait(qframe, expect_cmd=CMD_STATUS_REPORT, timeout=1.0)
+
+    if resp:
+        # 硬件有应答，用硬件数据恢复
+        from services.protocol import parse_status_report
+        hw = parse_status_report(resp["data"])
+        with _lock:
+            _shot_state["running"] = hw["running"]
+            _shot_state["elapsed"] = hw["elapsed"]
+            _shot_state["total"] = hw["remaining"] + hw["elapsed"]
+            _shot_state["remaining"] = hw["remaining"]
+            _shot_state["yali_now"] = hw["yali"]
+            _shot_state["yao_left"] = hw["yao"]
+            _shot_state["mode"] = row["mode"] or "cont"
+            _shot_state["ji_liang"] = row["target_dose"]
+            _shot_state["lock_token"] = row["lock_token"]
+            _shot_state["started_by"] = "(恢复)"
+        _persist_device_state()
+        print("[RECOVER] 已从硬件恢复状态")
+
+        if ws_pool and hw["running"]:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                ws_pool.blast({"type": "progress", "data": get_shot_state()}),
+                loop
+            )
+    else:
+        # 硬件无响应，标记异常终止
+        print("[RECOVER] 硬件无响应，上次注射标记为异常终止")
+        _clear_device_state()
+        db.execute("""
+            INSERT INTO alarms (injection_id, alarm_level, msg, yali_val, yao_val)
+            VALUES (NULL, 'jiting', '系统重启后硬件无响应，上次注射异常终止', 0, 0)
+        """)
+        db.commit()
+        if ws_pool:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                ws_pool.blast({
+                    "type": "notification",
+                    "data": {"level": "error", "msg": "系统重启检测到未完成注射，硬件无响应，已标记异常"}
+                }),
+                loop
+            )
+
+# ---------- 曲线相关 ----------
 
 def _build_curve(points_raw):
-    """把前端传来的曲线点转成内部格式
-    points_raw: [{"t": 0, "rate": 5}, {"t": 30, "rate": 8}, ...]
-    返回: [(t_start, t_end, rate), ...]
-    """
     pts = sorted(points_raw, key=lambda x: x.get("t", 0))
     result = []
     for i in range(len(pts) - 1):
-        t0 = pts[i]["t"]
-        t1 = pts[i + 1]["t"]
-        r = pts[i]["rate"]
-        result.append((t0, t1, r))
+        result.append((pts[i]["t"], pts[i + 1]["t"], pts[i]["rate"]))
     return result
 
 def _get_curve_rate(elapsed, segments):
-    """根据已用时间查曲线速率"""
     for seg in segments:
         if seg[0] <= elapsed < seg[1]:
             return seg[2]
     if segments and elapsed >= segments[-1][1]:
         return segments[-1][2]
-    return 5.0  # fallback
+    return 5.0
 
-# ---------- 模拟后台循环 ----------
+# ---------- 模拟循环 ----------
 
 def _sim_loop(ws_pool):
-    """后台线程 - 模拟注射过程 + 压力/药量变化"""
-    from config import SIM_PRESSURE_BASE, SIM_YAOLIANG_RATE, SIM_INTERVAL
+    from config import SIM_INTERVAL
     import asyncio
 
-    # 搞个临时变量防止重复报警
+    # 拿到 event loop 引用（只拿一次）
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     last_alarm_lv = None
+    last_persist = 0
+    persist_interval = 0.2  # 200ms 批量写一次
 
     while True:
         time.sleep(SIM_INTERVAL)
@@ -79,55 +170,35 @@ def _sim_loop(ws_pool):
                 last_alarm_lv = None
                 continue
 
-            # 间歇模式处理：如果在间隔期就先等着
             if _shot_state["mode"] == "jianxie" and _shot_state["jian_ge_left"] > 0:
                 _shot_state["jian_ge_left"] -= SIM_INTERVAL
                 if _shot_state["jian_ge_left"] <= 0:
                     _shot_state["jian_ge_left"] = 0
                 st = dict(_shot_state)
-                # 间隔中也推状态
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
                 asyncio.run_coroutine_threadsafe(
-                    ws_pool.blast({"type": "progress", "data": st}),
-                    loop
-                )
+                    ws_pool.blast({"type": "progress", "data": st}), loop)
                 continue
 
-            # 增加已用时间
             _shot_state["elapsed"] += SIM_INTERVAL
             _shot_state["remaining"] = max(0, _shot_state["total"] - _shot_state["elapsed"])
 
-            # 自定义曲线模式 - 根据曲线调整当前速率
             if _shot_state["mode"] == "custom" and _shot_state["curve_points"]:
-                cur_rate = _get_curve_rate(_shot_state["elapsed"], _shot_state["curve_points"])
-                _shot_state["su_lv"] = cur_rate
+                _shot_state["su_lv"] = _get_curve_rate(_shot_state["elapsed"], _shot_state["curve_points"])
 
-            # 模拟压力变化 - 随机漫步 + 周期性波动
             base_walk = random.uniform(-1.5, 2.5)
-            wave = math.sin(_shot_state["elapsed"] * 0.1) * 1.5  # 加个正弦波动
-            delta_p = base_walk + wave
-            _shot_state["yali_now"] += delta_p
-            if _shot_state["yali_now"] < 0:
-                _shot_state["yali_now"] = 0
+            wave = math.sin(_shot_state["elapsed"] * 0.1) * 1.5
+            _shot_state["yali_now"] += base_walk + wave
+            _shot_state["yali_now"] = max(0, _shot_state["yali_now"])
 
-            # 药量递减（与实际速率挂钩）
             real_decay = (_shot_state["su_lv"] / 3600.0) * SIM_INTERVAL
-            _shot_state["yao_left"] -= real_decay
-            if _shot_state["yao_left"] < 0:
-                _shot_state["yao_left"] = 0
+            _shot_state["yao_left"] = max(0, _shot_state["yao_left"] - real_decay)
 
-            # 检查是否需要报警
             alarm_hit = check_alarms(_shot_state["yali_now"], _shot_state["yao_left"])
 
-            # 避免重复报警刷屏
             if alarm_hit:
                 cur_lv = alarm_hit["level"]
                 if cur_lv == last_alarm_lv:
-                    alarm_hit["_dup"] = True  # 标记重复，只推进度不推 alarm 事件
+                    alarm_hit["_dup"] = True
                 else:
                     last_alarm_lv = cur_lv
             else:
@@ -136,85 +207,73 @@ def _sim_loop(ws_pool):
             st = dict(_shot_state)
             st["alarm"] = alarm_hit
 
-            # push 进度给所有客户端
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
             if alarm_hit and alarm_hit["do_jiting"] and not alarm_hit.get("_dup"):
                 _shot_state["jiting"] = True
                 _shot_state["running"] = False
                 _log_alarm_db(alarm_hit)
                 _finish_inj_db("jiting")
+                _clear_device_state()
 
             # 广播进度
             asyncio.run_coroutine_threadsafe(
-                ws_pool.blast({"type": "progress", "data": st}),
-                loop
-            )
+                ws_pool.blast({"type": "progress", "data": st}), loop)
 
+            # 报警广播（不用新线程 + sleep 了）
             if alarm_hit and not alarm_hit.get("_dup"):
-                # setTimeout 风格的延时广播，避免太密集
-                def delayed_broadcast(alarm_data):
-                    time.sleep(0.3)
-                    try:
-                        loop2 = asyncio.get_event_loop()
-                    except RuntimeError:
-                        loop2 = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop2)
-                    asyncio.run_coroutine_threadsafe(
-                        ws_pool.blast({"type": "alarm", "data": alarm_data}),
-                        loop2
-                    )
-                t = threading.Thread(target=delayed_broadcast, args=(alarm_hit,), daemon=True)
-                t.start()
+                asyncio.run_coroutine_threadsafe(
+                    ws_pool.blast({"type": "alarm", "data": alarm_hit}), loop)
 
             # 注射完成
             if _shot_state["remaining"] <= 0 and _shot_state["total"] > 0:
                 _shot_state["running"] = False
                 _finish_inj_db("done")
+                _clear_device_state()
                 asyncio.run_coroutine_threadsafe(
-                    ws_pool.blast({"type": "shot_done", "data": dict(_shot_state)}),
-                    loop
-                )
-                # 触发完成通知
+                    ws_pool.blast({"type": "shot_done", "data": dict(_shot_state)}), loop)
                 asyncio.run_coroutine_threadsafe(
                     ws_pool.blast({
                         "type": "notification",
-                        "data": {
-                            "level": "success",
-                            "msg": f"注射完成！模式: {_shot_state['mode']}, 剂量: {_shot_state['ji_liang']}mL"
-                        }
-                    }),
-                    loop
-                )
+                        "data": {"level": "success", "msg": f"注射完成！剂量: {_shot_state['ji_liang']}mL"}
+                    }), loop)
                 break
 
-            # 间歇模式：到了一段时间就切到间隔
+            # 间歇模式
             if _shot_state["mode"] == "jianxie" and _shot_state["jian_ge"] > 0:
-                cycle_time = _shot_state["total"] / (1 + _shot_state["jian_ge"]) if _shot_state["jian_ge"] > 0 else _shot_state["total"]
-                # 简化：每隔一段时间就歇
                 if _shot_state["elapsed"] % (_shot_state["jian_ge"] + 10) < SIM_INTERVAL and _shot_state["elapsed"] > 5:
                     _shot_state["jian_ge_left"] = _shot_state["jian_ge"]
+
+            # 每200ms持久化一次
+            last_persist += SIM_INTERVAL
+            if last_persist >= persist_interval:
+                last_persist = 0
+                _persist_device_state()
 
 # ---------- 启动/停止 ----------
 
 def start_injection(params: dict, uname: str, ws_pool):
-    """开始打药"""
     global _bg_thread, _curve_idx
+    lock_tok = str(uuid.uuid4())
+
     with _lock:
         if _shot_state["running"]:
-            return False, "已经有注射在跑了，先停了再说"
+            return False, "已经有注射在跑了"
+
+        # 原子锁：通过 device_state 表确保唯一
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("""
+            UPDATE device_state SET lock_token=?, is_running=1,
+                start_time=datetime('now','localtime'), updated_at=datetime('now','localtime')
+            WHERE id=1 AND is_running=0
+        """, (lock_tok,))
+        if cur.rowcount == 0:
+            return False, "注射锁被占用（其他终端可能在操作）"
 
         mode = params.get("mode", "cont")
         su_lv = float(params.get("su_lv", 5))
         ji_liang = float(params.get("ji_liang", 10))
         total_t = float(params.get("total_time", 60))
         jian_ge = float(params.get("jian_ge", 0))
-
-        # 自定义曲线 - 解析曲线点
         curve_segs = []
         raw_pts = params.get("curve_points", [])
         if mode == "custom" and raw_pts:
@@ -229,21 +288,18 @@ def start_injection(params: dict, uname: str, ws_pool):
         _shot_state["elapsed"] = 0
         _shot_state["remaining"] = total_t
         _shot_state["yali_now"] = 50.0
-        _shot_state["yao_left"] = ji_liang  # 初始药量=剂量
+        _shot_state["yao_left"] = ji_liang
         _shot_state["started_by"] = uname
         _shot_state["jiting"] = False
         _shot_state["paused"] = False
         _shot_state["jian_ge"] = jian_ge
         _shot_state["jian_ge_left"] = 0
         _shot_state["curve_points"] = curve_segs
+        _shot_state["lock_token"] = lock_tok
 
-        # 写一条 DB 记录 - 顺便记下用户ID
-        db = get_db()
-        cur = db.cursor()
-        # 先通过用户名找 uid
+        # DB 记录
         urow = db.execute("SELECT id FROM users WHERE username=?", (uname,)).fetchone()
         uid = urow["id"] if urow else 1
-
         cur.execute("""
             INSERT INTO injections (user_id, shot_mode, su_lv, ji_liang, total_time, jian_ge, status, started_at, notes)
             VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
@@ -251,42 +307,43 @@ def start_injection(params: dict, uname: str, ws_pool):
         db.commit()
         _shot_state["record_id"] = cur.lastrowid
 
-    # 启动模拟线程
+        _persist_device_state()
+
     _bg_thread = threading.Thread(target=_sim_loop, args=(ws_pool,), daemon=True)
     _bg_thread.start()
-
     return True, f"注射已启动, 模式: {mode}"
 
-def stop_injection(uname: str):
-    """停止注射 - 谁都可以停，但记录是谁停的"""
+def stop_injection(uname: str, lock_token: str = None, force: bool = False):
+    """停止注射，管理员可强制（force=True 跳过 lock_token 检查）"""
     with _lock:
         if not _shot_state["running"]:
-            return False, "没在跑，停啥"
+            return False, "没在跑"
+        if not force and lock_token and _shot_state.get("lock_token") != lock_token:
+            return False, "不是你的锁，不能停"
         _shot_state["running"] = False
         _shot_state["elapsed"] = _shot_state["total"] - _shot_state["remaining"]
         _finish_inj_db("stopped")
-        # 记录操作
+        _clear_device_state()
         db = get_db()
-        db.execute("INSERT INTO op_logs (user_id, username, action, ip_addr) VALUES (?,?,?,?)",
-                   (0, uname, f"停止注射 #{_shot_state.get('record_id')}", "ws"))
+        from auth import sign_log_entry
+        sig = sign_log_entry(0, "ws", f"停止注射 #{_shot_state.get('record_id')}")
+        db.execute("INSERT INTO op_logs (user_id, username, action, ip_addr, signature) VALUES (?,?,?,?,?)",
+                   (0, uname, f"停止注射 #{_shot_state.get('record_id')}", "ws", sig))
         db.commit()
         return True, "已停止"
 
 def _finish_inj_db(status: str):
-    """更新 DB 里的注射记录状态"""
     rid = _shot_state.get("record_id")
     if not rid:
         return
     db = get_db()
     real_dose = _shot_state.get("ji_liang", 0) - _shot_state.get("yao_left", 0)
     db.execute("""
-        UPDATE injections SET status=?, ended_at=?, real_dose=?
-        WHERE id=?
+        UPDATE injections SET status=?, ended_at=?, real_dose=? WHERE id=?
     """, (status, datetime.now().isoformat(), max(0, real_dose), rid))
     db.commit()
 
 def _log_alarm_db(alarm_info: dict):
-    """把报警写进 alarms 表"""
     db = get_db()
     db.execute("""
         INSERT INTO alarms (injection_id, alarm_level, msg, yali_val, yao_val)
@@ -300,14 +357,12 @@ def _log_alarm_db(alarm_info: dict):
     ))
     db.commit()
 
-# ---------- 历史记录辅助 ----------
+# ---------- 历史/推荐 ----------
 
 def get_shot_history(page=1, page_size=20, start_d="", end_d="", mode="", min_dose=None, max_dose=None):
-    """查注射历史，多条件筛选"""
     db = get_db()
     sql = "SELECT i.*, u.username FROM injections i LEFT JOIN users u ON i.user_id = u.id WHERE 1=1"
     params = []
-
     if start_d:
         sql += " AND i.started_at >= ?"
         params.append(start_d)
@@ -323,20 +378,14 @@ def get_shot_history(page=1, page_size=20, start_d="", end_d="", mode="", min_do
     if max_dose is not None:
         sql += " AND i.ji_liang <= ?"
         params.append(max_dose)
-
     count_sql = sql.replace("SELECT i.*, u.username", "SELECT COUNT(*) as c")
     total = db.execute(count_sql, params).fetchone()["c"]
-
     sql += " ORDER BY i.started_at DESC LIMIT ? OFFSET ?"
     params.extend([page_size, (page - 1) * page_size])
     rows = db.execute(sql, params).fetchall()
-
     return {"list": [dict(r) for r in rows], "total": total, "page": page}
 
-# ---------- 剂量推荐 ----------
-
 def get_yao_recommend(user_id: int = None):
-    """剂量推荐 - 最近5次加权平均 + 模式适配"""
     db = get_db()
     rows = db.execute("""
         SELECT ji_liang, shot_mode FROM injections WHERE status != 'running'
@@ -344,32 +393,24 @@ def get_yao_recommend(user_id: int = None):
     """).fetchall()
     if not rows:
         return {"recommend": 10.0, "avg_su_lv": 5.0, "mode_hint": "cont"}
-
     vals = [r["ji_liang"] for r in rows]
     n = len(vals)
     if n == 1:
         return {"recommend": vals[0], "avg_su_lv": 5.0, "mode_hint": rows[0]["shot_mode"]}
-
-    total_w = 0
-    total_v = 0
+    total_w, total_v = 0, 0
     for i, v in enumerate(vals):
         w = i + 1
         total_w += w
         total_v += v * w
-    # 最常见的模式
     modes = [r["shot_mode"] for r in rows]
     mode_hint = max(set(modes), key=modes.count)
-
     return {
         "recommend": round(total_v / total_w, 2),
-        "avg_su_lv": round((total_v / total_w) / 60 * 3600, 1),  # 估算速率
+        "avg_su_lv": round((total_v / total_w) / 60 * 3600, 1),
         "mode_hint": mode_hint
     }
 
-# ---------- 几个冗余的查询方法（为了多端复用） ----------
-
 def get_running_shot():
-    """查询当前是否有正在跑的注射"""
     db = get_db()
     row = db.execute("SELECT * FROM injections WHERE status='running' ORDER BY started_at DESC LIMIT 1").fetchone()
     if row:
@@ -379,13 +420,11 @@ def get_running_shot():
     return None
 
 def count_today_shots():
-    """今天打了几次"""
     db = get_db()
     row = db.execute("SELECT COUNT(*) as c FROM injections WHERE DATE(started_at)=DATE('now')").fetchone()
     return row["c"] if row else 0
 
 def get_latest_alarms(limit=5):
-    """最近几条报警"""
     db = get_db()
     rows = db.execute("SELECT * FROM alarms ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]

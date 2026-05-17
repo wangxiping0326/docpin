@@ -1,4 +1,4 @@
-# db stuff - sqlite3 初始化，建表都在这里
+# db stuff - sqlite3 WAL模式 + 所有表
 import sqlite3
 import os
 from config import DB_PATH, DEFAULT_THRESHOLDS
@@ -10,6 +10,9 @@ def get_db():
     if _conn is None:
         _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
+        # WAL + busy_timeout
+        _conn.execute("PRAGMA journal_mode=WAL;")
+        _conn.execute("PRAGMA busy_timeout=5000;")
     return _conn
 
 def init_db():
@@ -17,25 +20,28 @@ def init_db():
     db = get_db()
     cur = db.cursor()
 
-    # 用户表
+    # 用户表 - 加了 locked_until, password_updated_at
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             pwd_hash TEXT NOT NULL,
-            role TEXT DEFAULT 'operator',  -- admin / operator
+            role TEXT DEFAULT 'operator',
             is_active INTEGER DEFAULT 1,
+            login_fails INTEGER DEFAULT 0,
+            locked_until TEXT,
+            password_updated_at TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # 设备表 - 注射器
+    # 设备表
     cur.execute("""
         CREATE TABLE IF NOT EXISTS devices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_uid TEXT UNIQUE NOT NULL,
             dev_name TEXT DEFAULT '',
-            status TEXT DEFAULT 'offline',  -- online / offline / working
+            status TEXT DEFAULT 'offline',
             last_seen TIMESTAMP,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -48,12 +54,12 @@ def init_db():
             user_id INTEGER NOT NULL,
             device_id INTEGER,
             shot_mode TEXT NOT NULL,
-            su_lv REAL DEFAULT 0,        -- 速率
-            ji_liang REAL DEFAULT 0,      -- 剂量
-            total_time REAL DEFAULT 0,    -- 注射时长(秒)
-            jian_ge REAL DEFAULT 0,       -- 间歇间隔
-            real_dose REAL DEFAULT 0,     -- 实际注射药量
-            status TEXT DEFAULT 'done',   -- running / stopped / done / jiting
+            su_lv REAL DEFAULT 0,
+            ji_liang REAL DEFAULT 0,
+            total_time REAL DEFAULT 0,
+            jian_ge REAL DEFAULT 0,
+            real_dose REAL DEFAULT 0,
+            status TEXT DEFAULT 'done',
             notes TEXT DEFAULT '',
             started_at TIMESTAMP,
             ended_at TIMESTAMP
@@ -65,7 +71,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS alarms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             injection_id INTEGER,
-            alarm_level TEXT NOT NULL,    -- warn1 / warn2 / jiting
+            alarm_level TEXT NOT NULL,
             msg TEXT DEFAULT '',
             yali_val REAL DEFAULT 0,
             yao_val REAL DEFAULT 0,
@@ -74,7 +80,7 @@ def init_db():
         )
     """)
 
-    # 操作日志
+    # 操作日志 - 加了 signature, archived（审计追溯，禁止物理删除）
     cur.execute("""
         CREATE TABLE IF NOT EXISTS op_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,11 +88,13 @@ def init_db():
             username TEXT DEFAULT '',
             action TEXT DEFAULT '',
             ip_addr TEXT DEFAULT '',
+            signature TEXT DEFAULT '',
+            archived INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # 系统设置 - kv 存储
+    # 系统设置
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             skey TEXT PRIMARY KEY,
@@ -94,8 +102,41 @@ def init_db():
         )
     """)
 
+    # 设备状态持久化 - 断电恢复用（单行表）
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS device_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            device_id TEXT NOT NULL DEFAULT '',
+            is_running INTEGER NOT NULL DEFAULT 0,
+            mode TEXT DEFAULT '',
+            target_dose REAL DEFAULT 0,
+            remaining_dose REAL DEFAULT 0,
+            elapsed_seconds REAL DEFAULT 0,
+            total_seconds REAL DEFAULT 0,
+            yali_now REAL DEFAULT 0,
+            start_time TEXT DEFAULT '',
+            lock_token TEXT DEFAULT '',
+            updated_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+
+    # 电子签名记录
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS esig_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT DEFAULT '',
+            action TEXT DEFAULT '',
+            success INTEGER DEFAULT 0,
+            signature TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 确保 device_state 有一行
+    cur.execute("INSERT OR IGNORE INTO device_state (id, device_id) VALUES (1, '')")
+
     # 写入默认阈值
-    import json
     default_settings = [
         ("thresh_yali_warn", str(DEFAULT_THRESHOLDS["yalijiance"])),
         ("thresh_yaol_warn", str(DEFAULT_THRESHOLDS["yaol_warn"])),
@@ -106,17 +147,40 @@ def init_db():
 
     db.commit()
 
+    # ---------- 迁移：给旧表加新字段（防止升级时报 no such column）----------
+    migrations = [
+        # users 表
+        ("ALTER TABLE users ADD COLUMN login_fails INTEGER DEFAULT 0", "users.login_fails"),
+        ("ALTER TABLE users ADD COLUMN locked_until TEXT", "users.locked_until"),
+        ("ALTER TABLE users ADD COLUMN password_updated_at TEXT", "users.password_updated_at"),
+        # op_logs 表
+        ("ALTER TABLE op_logs ADD COLUMN signature TEXT DEFAULT ''", "op_logs.signature"),
+        ("ALTER TABLE op_logs ADD COLUMN archived INTEGER DEFAULT 0", "op_logs.archived"),
+    ]
+    for sql, col_name in migrations:
+        try:
+            cur.execute(sql)
+            db.commit()
+            print(f"[DB] 迁移完成: {col_name}")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
     # 首次启动：如果没有 admin 用户就创建默认的
     cur.execute("SELECT COUNT(*) as c FROM users WHERE role='admin'")
     row = cur.fetchone()
     if row["c"] == 0:
         import bcrypt
+        from datetime import datetime
         pwd = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
-        cur.execute("INSERT INTO users (username, pwd_hash, role) VALUES (?, ?, ?)",
-                    ("admin", pwd, "admin"))
-        cur.execute("INSERT INTO users (username, pwd_hash, role) VALUES (?, ?, ?)",
-                    ("op1", pwd, "operator"))
+        now = datetime.now().isoformat()
+        cur.execute(
+            "INSERT INTO users (username, pwd_hash, role, password_updated_at) VALUES (?, ?, ?, ?)",
+            ("admin", pwd, "admin", now))
+        cur.execute(
+            "INSERT INTO users (username, pwd_hash, role, password_updated_at) VALUES (?, ?, ?, ?)",
+            ("op1", pwd, "operator", now))
         db.commit()
         print("[DB] 默认用户已创建 admin / op1 密码都是 admin123")
+        print("[DB] !!! 请在首次登录后立即修改密码！")
 
-    print("[DB] 数据库初始化完成")
+    print("[DB] 数据库初始化完成 (WAL模式)")
